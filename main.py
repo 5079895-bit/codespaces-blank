@@ -224,7 +224,7 @@ async def cb_delete_last(callback: CallbackQuery):
 @dp.callback_query(F.data == "fix_last")
 async def cb_fix_last(callback: CallbackQuery):
     user_id = callback.from_user.id
-    # Ставим флаг, что мы в режиме исправления
+    # Создаем блокнот с флагом исправления
     _pending_clarification[user_id] = {"is_fix": True}
     await callback.message.answer("Хорошо, напиши заново, что нужно исправить (например: «борщ 250»).")
     await callback.answer()
@@ -456,7 +456,7 @@ async def _show_norms_and_finish(message: types.Message, user_id: int):
     )
     await message.answer(text_result)
     
-    await asyncio.sleep(1) # Небольшая пауза, чтобы сообщения не слипались
+    await asyncio.sleep(1)
     await message.answer(DIARY_HELP_TEXT + "\n\n" + DIARY_HELP_TAIL, reply_markup=_main_menu_keyboard(user))
 
 THANKS_WORDS = ("спасибо", "благодарю", "спс", "thanks")
@@ -476,7 +476,11 @@ async def _handle_work(message, user_id, text):
     user = database.get_user(user_id)
     today_str = database._get_user_date(user_id, user.get('utc_offset', 3))
 
-    # --- 1. САМОЕ ВАЖНОЕ: Кнопки меню всегда главнее любых режимов ---
+    # 1. ПРИОРИТЕТ КНОПОК МЕНЮ (Всегда главнее всего)
+    if message.photo:
+        await _handle_photo(message, user_id, text if text else None)
+        return
+
     if text == BTN_EAT:
         _help_mode.discard(user_id)
         _help_waiting_answer.discard(user_id)
@@ -491,55 +495,31 @@ async def _handle_work(message, user_id, text):
         return
     if text == BTN_HELP:
         _help_mode.add(user_id)
-        _help_waiting_answer.discard(user_id)
-        _pending_clarification.pop(user_id, None)
         await message.answer("Я тут! Спрашивай, что тебя интересует про еду или питание. 💚")
         return
 
-    # --- 2. Обработка фото ---
-    if message.photo:
-        await _handle_photo(message, user_id, text if text else None)
-        return
-
-    # --- 3. Жесткий режим "да/нет" ---
+    # 2. РЕЖИМ "КОТИК ПОДСКАЖИ" (и ожидание ответа да/нет)
     if user_id in _help_waiting_answer:
         if text_lower in ("да", "ага", "угу", "конечно"):
             _help_waiting_answer.discard(user_id)
             await message.answer("Хорошо, спрашивай! 💚")
+            return
         elif text_lower in ("нет", "неа", "хватит", "всё"):
             _help_waiting_answer.discard(user_id)
             _help_mode.discard(user_id)
             await message.answer("Понял, возвращаемся к дневнику. Присылай, что съел — текстом или фото.", reply_markup=_main_menu_keyboard(user))
+            return
         else:
-            # Любой другой текст (включая "Борщ", "А соль?" и т.д.) - игнорируем и просим да/нет
-            await message.answer("<i>Есть еще вопросы? Напиши 'да' или 'нет'.</i>")
-        return
+            _help_waiting_answer.discard(user_id)
+            await message.answer("Секунду, думаю...")
+            answer = _safe_ask_ai(text)
+            if answer: 
+                await message.answer(f"{_esc(answer)}\n\n<i>Есть еще вопросы? Напиши 'да' или 'нет'.</i>")
+                _help_waiting_answer.add(user_id)
+            else: 
+                await message.answer("Не смог ответить.")
+            return
 
-    # --- 4. Режим исправления (Fix last) ---
-    if user_id in _pending_clarification:
-        pending = _pending_clarification.get(user_id)
-        
-        # Если это флаг исправления и человек написал сервисное слово или нажал кнопку - отменяем исправление
-        if pending.get("is_fix"):
-            if any(w in text_lower for w in THANKS_WORDS + GREET_WORDS + BYE_WORDS) or text in (BTN_EAT, BTN_SUMMARY, BTN_HELP):
-                _pending_clarification.pop(user_id, None)
-                service = _service_reply(text_lower)
-                if service: 
-                    await message.answer(service)
-                else:
-                    await message.answer("Понял, исправление отменено. Возвращаемся.")
-                return
-        else:
-            # Обычный режим уточнений
-            if any(w in text_lower for w in THANKS_WORDS + GREET_WORDS + BYE_WORDS):
-                _pending_clarification.pop(user_id, None)
-                service = _service_reply(text_lower)
-                if service: await message.answer(service); return
-            else:
-                await _handle_clarification_answer(message, user_id, text, today_str)
-                return
-
-    # --- 5. Обычный режим "Котик, подскажи" (когда только что зашли) ---
     if user_id in _help_mode:
         if any(w in text_lower for w in THANKS_WORDS):
             _help_mode.discard(user_id)
@@ -554,22 +534,25 @@ async def _handle_work(message, user_id, text):
             await message.answer("Не смог ответить.")
         return
 
-    # --- 6. Сервисные ответы ---
+    # 3. РЕЖИМ УТОЧНЕНИЙ ("БЛОКНОТ")
+    if user_id in _pending_clarification:
+        if any(w in text_lower for w in THANKS_WORDS + GREET_WORDS + BYE_WORDS):
+            _pending_clarification.pop(user_id, None)
+            service = _service_reply(text_lower)
+            if service: await message.answer(service); return
+        else:
+            await _handle_clarification_answer(message, user_id, text, today_str)
+            return
+
+    # 4. ОБЫЧНЫЙ ОТВЕТ (служебные слова)
     service = _service_reply(text_lower)
-    if service: 
-        await message.answer(service)
-        return
+    if service: await message.answer(service); return
 
     if not text:
         await message.answer("Я понимаю только текст и фото.")
         return
 
-    # --- 7. Запись еды ---
-    is_fixing = False
-    if user_id in _pending_clarification and _pending_clarification[user_id].get("is_fix"):
-        is_fixing = True
-        _pending_clarification.pop(user_id, None)
-
+    # 5. ЗАПИСЬ ЕДЫ
     await message.answer("Секунду, смотрю...")
     
     ai_res = ai.get_questions_for_ai(text)
@@ -579,7 +562,7 @@ async def _handle_work(message, user_id, text):
     if not questions:
         food_data = ai.calculate_nutrition(dish, text)
         if food_data and food_data.get('calories') is not None:
-            await _save_food_and_reply(message, user_id, food_data, fallback_dish=dish, today_str=today_str, is_fix=is_fixing)
+            await _save_food_and_reply(message, user_id, food_data, fallback_dish=dish, today_str=today_str, is_fix=False)
         else:
             await message.answer("Не смог посчитать. Попробуй написать вес (например 200 г).")
         return
@@ -590,7 +573,7 @@ async def _handle_work(message, user_id, text):
         "questions": questions,
         "answers": [],
         "current_index": 0,
-        "is_fix": is_fixing
+        "is_fix": False
     }
     
     await message.answer(f"Записал: {_esc(dish)}. {_esc(questions[0])}")
@@ -600,7 +583,49 @@ async def _handle_clarification_answer(message, user_id, text, today_str):
     pending = _pending_clarification.get(user_id)
     if not pending: return
 
+    # Обработка режима "Исправить"
+    if pending.get("is_fix"):
+        _pending_clarification.pop(user_id, None)
+        await message.answer("Секунду, смотрю...")
+        
+        ai_res = ai.get_questions_for_ai(text)
+        dish = ai_res.get("dish", text)
+        questions = ai_res.get("questions", [])
+
+        if not questions:
+            food_data = ai.calculate_nutrition(dish, text)
+            if food_data and food_data.get('calories') is not None:
+                await _save_food_and_reply(message, user_id, food_data, fallback_dish=dish, today_str=today_str, is_fix=True)
+            else:
+                await message.answer("Не смог посчитать. Попробуй написать вес (например 200 г).")
+            return
+
+        # Если после нажатия "Исправить" появились вопросы, сохраняем флаг is_fix!
+        _pending_clarification[user_id] = {
+            "original_text": text,
+            "dish": dish,
+            "questions": questions,
+            "answers": [],
+            "current_index": 0,
+            "is_fix": True
+        }
+        await message.answer(f"Записал: {_esc(dish)}. {_esc(questions[0])}")
+        return
+
+    # Обычная обработка ответов на вопросы
     answer = text.strip()
+    
+    # Умный разбор цифр (если ответ "2", уточняем)
+    if answer.isdigit() and len(answer) <= 2:
+        # Если бот спрашивал про штуки или количество
+        current_q = pending["questions"][pending["current_index"]].lower()
+        if "штук" in current_q or "сколько" in current_q:
+            pass # оставляем "2", ИИ сам поймет, что это штуки
+        else:
+            # Если бот ждал граммы, а получил "2" - переспрашиваем
+            await message.answer(f"Ты имеешь в виду {answer} штуки или {answer} грамма?")
+            return
+
     if any(w in answer.lower() for w in ("не знаю", "незнаю", "как обычно", "на глаз")):
         answer = "стандарт"
 
@@ -616,7 +641,7 @@ async def _handle_clarification_answer(message, user_id, text, today_str):
     _pending_clarification.pop(user_id, None)
     dish = pending["dish"]
     details = ", ".join(pending["answers"])
-    is_fixing = pending.get("is_fix", False)
+    is_fix = pending.get("is_fix", False)
     
     await message.answer(f"Понял. Секунду, считаю «{_esc(dish)}»...")
     food_data = ai.calculate_nutrition(dish, details)
@@ -624,7 +649,7 @@ async def _handle_clarification_answer(message, user_id, text, today_str):
     if not food_data or food_data.get('calories') is None:
         await message.answer(f"Не смог распознать КБЖУ для «{_esc(dish)}». Попробуй иначе.")
         return
-    await _save_food_and_reply(message, user_id, food_data, fallback_dish=dish, today_str=today_str, is_fix=is_fixing)
+    await _save_food_and_reply(message, user_id, food_data, fallback_dish=dish, today_str=today_str, is_fix=is_fix)
 
 
 async def _handle_photo(message, user_id, caption=None):
@@ -656,6 +681,7 @@ async def _handle_photo(message, user_id, caption=None):
             "questions": ["Если всё верно — уточни вес каждого (например: суп 300, макароны 200). Или скажи 'не знаю', и я возьму средние порции."],
             "answers": [],
             "current_index": 0,
+            "is_fix": False,
             "is_draft": True
         }
         await message.answer(f"Вижу: {_esc(desc)}\n\nЕсли всё верно — уточни вес каждого, или я могу посчитать средние значения. Если нужны правки — напиши свой вариант.")
@@ -665,7 +691,8 @@ async def _handle_photo(message, user_id, caption=None):
             "dish": desc,
             "questions": ["Сколько примерно грамм?"],
             "answers": [],
-            "current_index": 0
+            "current_index": 0,
+            "is_fix": False
         }
         await message.answer(f"Вижу: {_esc(desc)}\n\nСколько примерно грамм?")
 
@@ -685,24 +712,24 @@ async def _save_food_and_reply(message, user_id, food_data, fallback_dish, today
     is_liquid = 1 if food_data.get('is_liquid') else 0
     ml = food_data.get('ml')
     salt = food_data.get('salt', 0) or 0
-    sugar = food_data.get('sugar', 0) or 0
-    bad_fat = food_data.get('bad_fat', 0) or 0
 
     try:
         if is_fix:
-            # Если это исправление - перезаписываем последнюю запись
+            # Обновляем последнюю запись
             database.update_last_food(
-                user_id, today_str, dish_name, cal, prot, fat, carb, sugar, bad_fat, weight,
+                user_id, today_str, dish_name, cal, prot, fat, carb,
+                food_data.get('sugar', 0), food_data.get('bad_fat', 0), weight,
                 is_liquid=is_liquid, ml=ml, salt=salt
             )
         else:
-            # Обычная запись
+            # Добавляем новую
             database.add_food(
-                user_id, today_str, dish_name, cal, prot, fat, carb, sugar, bad_fat, weight,
+                user_id, today_str, dish_name, cal, prot, fat, carb,
+                food_data.get('sugar', 0), food_data.get('bad_fat', 0), weight,
                 is_liquid=is_liquid, ml=ml, salt=salt
             )
     except Exception:
-        logger.exception("Ошибка сохранения еды")
+        logger.exception("Ошибка сохранения еды (is_fix=%s)", is_fix)
         await message.answer("Не смог сохранить. Попробуй ещё раз.")
         return
 
@@ -716,8 +743,8 @@ async def _save_food_and_reply(message, user_id, food_data, fallback_dish, today
     day_fat = summary['fat'] if summary else 0
     day_carb = summary['carbs'] if summary else 0
 
-    prefix = "Отлично, исправил запись:" if is_fix else "Отлично, записал:"
-    reply_text = f"{prefix} {_esc(dish_name)} ({weight} г/мл)\n"
+    action_word = "исправил" if is_fix else "записал"
+    reply_text = f"Отлично, {action_word}: {_esc(dish_name)} ({weight} г/мл)\n"
     reply_text += f"🔥 {cal} ккал | Б {prot} / Ж {fat} / У {carb}\n\n"
     
     if user.get('week', 1) == 1:
