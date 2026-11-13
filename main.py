@@ -36,7 +36,6 @@ _pending_week_end: set[int] = set()
 _pending_weekly_weight: set[int] = set()
 _pending_agree: set[int] = set()
 
-# Защита от спама сценария "Нет вины" (user_id: date_str)
 _no_guilt_shown_today: dict[int, str] = {}
 
 BTN_EAT = "🍽 Записать еду"
@@ -159,7 +158,6 @@ async def _send_day_summary(message: types.Message, user_id: int):
     day_carb = summary['carbs'] if summary else 0
     target_cal = norms['support_high']
     
-    # --- Сценарий "Нет вины" ---
     if day_cal > (target_cal + 500):
         if _no_guilt_shown_today.get(user_id) != today_str:
             conn = database._connect()
@@ -177,7 +175,6 @@ async def _send_day_summary(message: types.Message, user_id: int):
             await message.answer("Мы рядом. Всё хорошо. 💚")
             return
 
-    # --- Обычный итог ---
     if user.get('week', 1) == 1:
         ai_text = ai.generate_day_summary(user, summary, liquid_total) or "Ты сегодня отлично потрудился! 💚"
         await message.answer(
@@ -224,7 +221,6 @@ async def cb_delete_last(callback: CallbackQuery):
 @dp.callback_query(F.data == "fix_last")
 async def cb_fix_last(callback: CallbackQuery):
     user_id = callback.from_user.id
-    # Создаем блокнот с флагом исправления
     _pending_clarification[user_id] = {"is_fix": True}
     await callback.message.answer("Хорошо, напиши заново, что нужно исправить (например: «борщ 250»).")
     await callback.answer()
@@ -476,7 +472,6 @@ async def _handle_work(message, user_id, text):
     user = database.get_user(user_id)
     today_str = database._get_user_date(user_id, user.get('utc_offset', 3))
 
-    # 1. ПРИОРИТЕТ КНОПОК МЕНЮ (Всегда главнее всего)
     if message.photo:
         await _handle_photo(message, user_id, text if text else None)
         return
@@ -498,7 +493,7 @@ async def _handle_work(message, user_id, text):
         await message.answer("Я тут! Спрашивай, что тебя интересует про еду или питание. 💚")
         return
 
-    # 2. РЕЖИМ "КОТИК ПОДСКАЖИ" (и ожидание ответа да/нет)
+    # НОВАЯ ЛОГИКА ОЖИДАНИЯ "ДА" ИЛИ "НЕТ"
     if user_id in _help_waiting_answer:
         if text_lower in ("да", "ага", "угу", "конечно"):
             _help_waiting_answer.discard(user_id)
@@ -510,14 +505,8 @@ async def _handle_work(message, user_id, text):
             await message.answer("Понял, возвращаемся к дневнику. Присылай, что съел — текстом или фото.", reply_markup=_main_menu_keyboard(user))
             return
         else:
-            _help_waiting_answer.discard(user_id)
-            await message.answer("Секунду, думаю...")
-            answer = _safe_ask_ai(text)
-            if answer: 
-                await message.answer(f"{_esc(answer)}\n\n<i>Есть еще вопросы? Напиши 'да' или 'нет'.</i>")
-                _help_waiting_answer.add(user_id)
-            else: 
-                await message.answer("Не смог ответить.")
+            # ТУТ МЫ ИГНОРИРУЕМ ЛЮБОЙ ДРУГОЙ ТЕКСТ
+            await message.answer("Напиши 'да' или 'нет'.")
             return
 
     if user_id in _help_mode:
@@ -534,7 +523,6 @@ async def _handle_work(message, user_id, text):
             await message.answer("Не смог ответить.")
         return
 
-    # 3. РЕЖИМ УТОЧНЕНИЙ ("БЛОКНОТ")
     if user_id in _pending_clarification:
         if any(w in text_lower for w in THANKS_WORDS + GREET_WORDS + BYE_WORDS):
             _pending_clarification.pop(user_id, None)
@@ -544,7 +532,6 @@ async def _handle_work(message, user_id, text):
             await _handle_clarification_answer(message, user_id, text, today_str)
             return
 
-    # 4. ОБЫЧНЫЙ ОТВЕТ (служебные слова)
     service = _service_reply(text_lower)
     if service: await message.answer(service); return
 
@@ -552,7 +539,6 @@ async def _handle_work(message, user_id, text):
         await message.answer("Я понимаю только текст и фото.")
         return
 
-    # 5. ЗАПИСЬ ЕДЫ
     await message.answer("Секунду, смотрю...")
     
     ai_res = ai.get_questions_for_ai(text)
@@ -583,7 +569,6 @@ async def _handle_clarification_answer(message, user_id, text, today_str):
     pending = _pending_clarification.get(user_id)
     if not pending: return
 
-    # Обработка режима "Исправить"
     if pending.get("is_fix"):
         _pending_clarification.pop(user_id, None)
         await message.answer("Секунду, смотрю...")
@@ -600,7 +585,6 @@ async def _handle_clarification_answer(message, user_id, text, today_str):
                 await message.answer("Не смог посчитать. Попробуй написать вес (например 200 г).")
             return
 
-        # Если после нажатия "Исправить" появились вопросы, сохраняем флаг is_fix!
         _pending_clarification[user_id] = {
             "original_text": text,
             "dish": dish,
@@ -612,17 +596,12 @@ async def _handle_clarification_answer(message, user_id, text, today_str):
         await message.answer(f"Записал: {_esc(dish)}. {_esc(questions[0])}")
         return
 
-    # Обычная обработка ответов на вопросы
     answer = text.strip()
-    
-    # Умный разбор цифр (если ответ "2", уточняем)
     if answer.isdigit() and len(answer) <= 2:
-        # Если бот спрашивал про штуки или количество
         current_q = pending["questions"][pending["current_index"]].lower()
         if "штук" in current_q or "сколько" in current_q:
-            pass # оставляем "2", ИИ сам поймет, что это штуки
+            pass
         else:
-            # Если бот ждал граммы, а получил "2" - переспрашиваем
             await message.answer(f"Ты имеешь в виду {answer} штуки или {answer} грамма?")
             return
 
@@ -715,14 +694,12 @@ async def _save_food_and_reply(message, user_id, food_data, fallback_dish, today
 
     try:
         if is_fix:
-            # Обновляем последнюю запись
             database.update_last_food(
                 user_id, today_str, dish_name, cal, prot, fat, carb,
                 food_data.get('sugar', 0), food_data.get('bad_fat', 0), weight,
                 is_liquid=is_liquid, ml=ml, salt=salt
             )
         else:
-            # Добавляем новую
             database.add_food(
                 user_id, today_str, dish_name, cal, prot, fat, carb,
                 food_data.get('sugar', 0), food_data.get('bad_fat', 0), weight,
