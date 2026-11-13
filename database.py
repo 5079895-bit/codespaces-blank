@@ -1,14 +1,20 @@
 import sqlite3
 import logging
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'bot_database.db')
 
 def _connect():
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=10) # Добавлен timeout (защита от блокировки, п.3)
     conn.row_factory = sqlite3.Row
     return conn
+
+def _get_user_date(user_id, utc_offset):
+    """Возвращает текущую дату пользователя с учетом его часового пояса"""
+    now_utc = datetime.utcnow()
+    user_now = now_utc + timedelta(hours=utc_offset)
+    return user_now.strftime('%Y-%m-%d')
 
 def init_db():
     conn = _connect()
@@ -29,7 +35,8 @@ def init_db():
             age_attempts INTEGER DEFAULT 0,
             created_at TEXT,
             week INTEGER DEFAULT 1,
-            last_norms_update TEXT
+            last_norms_update TEXT,
+            utc_offset INTEGER DEFAULT 3
         )
     ''')
 
@@ -37,7 +44,7 @@ def init_db():
         CREATE TABLE IF NOT EXISTS food_log (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER,
-            date TEXT DEFAULT CURRENT_DATE,
+            date TEXT,
             dish TEXT,
             calories INTEGER,
             protein REAL,
@@ -45,7 +52,10 @@ def init_db():
             carbs REAL,
             sugar REAL,
             bad_fat REAL,
-            weight REAL
+            weight REAL,
+            is_liquid INTEGER DEFAULT 0,
+            ml INTEGER,
+            salt REAL DEFAULT 0
         )
     ''')
 
@@ -53,7 +63,7 @@ def init_db():
         CREATE TABLE IF NOT EXISTS water_log (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER,
-            date TEXT DEFAULT CURRENT_DATE,
+            date TEXT,
             ml INTEGER
         )
     ''')
@@ -62,7 +72,7 @@ def init_db():
         CREATE TABLE IF NOT EXISTS weight_log (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER,
-            date TEXT DEFAULT CURRENT_DATE,
+            date TEXT,
             weight REAL
         )
     ''')
@@ -74,17 +84,23 @@ def init_db():
         cursor.execute("ALTER TABLE users ADD COLUMN age_attempts INTEGER DEFAULT 0")
     if "created_at" not in columns:
         cursor.execute("ALTER TABLE users ADD COLUMN created_at TEXT")
-        cursor.execute("UPDATE users SET created_at = CURRENT_TIMESTAMP WHERE created_at IS NULL")
     if "week" not in columns:
         cursor.execute("ALTER TABLE users ADD COLUMN week INTEGER DEFAULT 1")
     if "last_norms_update" not in columns:
         cursor.execute("ALTER TABLE users ADD COLUMN last_norms_update TEXT")
-        cursor.execute("UPDATE users SET last_norms_update = CURRENT_TIMESTAMP WHERE last_norms_update IS NULL")
+    if "utc_offset" not in columns:
+        cursor.execute("ALTER TABLE users ADD COLUMN utc_offset INTEGER DEFAULT 3")
 
     cursor.execute("PRAGMA table_info(food_log)")
     food_columns = [row[1] for row in cursor.fetchall()]
     if "weight" not in food_columns:
         cursor.execute("ALTER TABLE food_log ADD COLUMN weight REAL")
+    if "is_liquid" not in food_columns:
+        cursor.execute("ALTER TABLE food_log ADD COLUMN is_liquid INTEGER DEFAULT 0")
+    if "ml" not in food_columns:
+        cursor.execute("ALTER TABLE food_log ADD COLUMN ml INTEGER")
+    if "salt" not in food_columns:
+        cursor.execute("ALTER TABLE food_log ADD COLUMN salt REAL DEFAULT 0")
 
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_food_log_user_date ON food_log (user_id, date)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_water_log_user_date ON water_log (user_id, date)')
@@ -104,11 +120,12 @@ def get_user(user_id):
         user_dict['survey_step'] = int(user_dict.get('survey_step') or 0)
         user_dict['week'] = int(user_dict.get('week') or 1)
         user_dict['weight'] = float(user_dict['weight']) if user_dict.get('weight') else None
+        user_dict['utc_offset'] = int(user_dict.get('utc_offset') or 3)
         return user_dict
     return None
 
 def save_answer(user_id, field, value):
-    allowed = {"name", "gender", "age", "height", "weight", "lifestyle", "dislikes", "restrictions", "age_attempts", "week", "last_norms_update"}
+    allowed = {"name", "gender", "age", "height", "weight", "lifestyle", "dislikes", "restrictions", "age_attempts", "week", "last_norms_update", "utc_offset"}
     if field not in allowed:
         raise ValueError(f"Недопустимое поле: {field}")
     conn = _connect()
@@ -135,24 +152,24 @@ def create_user(user_id):
     conn.commit()
     conn.close()
 
-def add_food(user_id, dish, calories, protein, fat, carbs, sugar, bad_fat, weight):
+def add_food(user_id, date, dish, calories, protein, fat, carbs, sugar, bad_fat, weight, is_liquid=0, ml=None, salt=0):
     conn = _connect()
     cursor = conn.cursor()
     cursor.execute('''
-        INSERT INTO food_log (user_id, dish, calories, protein, fat, carbs, sugar, bad_fat, weight)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-    ''', (user_id, dish, calories, protein, fat, carbs, sugar, bad_fat, weight))
+        INSERT INTO food_log (user_id, date, dish, calories, protein, fat, carbs, sugar, bad_fat, weight, is_liquid, ml, salt)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ''', (user_id, date, dish, calories, protein, fat, carbs, sugar, bad_fat, weight, is_liquid, ml, salt))
     conn.commit()
     conn.close()
 
-def get_day_summary(user_id):
+def get_day_summary(user_id, date):
     conn = _connect()
     cursor = conn.cursor()
     cursor.execute('''
         SELECT SUM(calories) as cal, SUM(protein) as prot, SUM(fat) as fat,
-               SUM(carbs) as carb, SUM(sugar) as sug, SUM(bad_fat) as bad_fat
-        FROM food_log WHERE user_id = ? AND date = CURRENT_DATE
-    ''', (user_id,))
+               SUM(carbs) as carb, SUM(sugar) as sug, SUM(bad_fat) as bad_fat, SUM(salt) as salt
+        FROM food_log WHERE user_id = ? AND date = ?
+    ''', (user_id, date))
     result = cursor.fetchone()
     conn.close()
 
@@ -166,69 +183,76 @@ def get_day_summary(user_id):
         "carbs": round(result['carb'], 1),
         "sugar": round(result['sug'], 1),
         "bad_fat": round(result['bad_fat'], 1),
+        "salt": round(result['salt'], 1),
     }
 
-def update_last_food(user_id, new_dish, calories, protein, fat, carbs, sugar, bad_fat, weight):
+def update_last_food(user_id, date, new_dish, calories, protein, fat, carbs, sugar, bad_fat, weight, is_liquid=None, ml=None, salt=0):
     conn = _connect()
     cursor = conn.cursor()
-    cursor.execute('SELECT id FROM food_log WHERE user_id = ? AND date = CURRENT_DATE ORDER BY id DESC LIMIT 1', (user_id,))
+    cursor.execute('SELECT id FROM food_log WHERE user_id = ? AND date = ? ORDER BY id DESC LIMIT 1', (user_id, date))
     row = cursor.fetchone()
     if row:
         last_id = row['id']
-        cursor.execute('''
-            UPDATE food_log SET dish = ?, calories = ?, protein = ?, fat = ?, carbs = ?, sugar = ?, bad_fat = ?, weight = ?
-            WHERE id = ?
-        ''', (new_dish, calories, protein, fat, carbs, sugar, bad_fat, weight, last_id))
+        if is_liquid is not None:
+            cursor.execute('''
+                UPDATE food_log SET dish = ?, calories = ?, protein = ?, fat = ?, carbs = ?, sugar = ?, bad_fat = ?, weight = ?, is_liquid = ?, ml = ?, salt = ?
+                WHERE id = ?
+            ''', (new_dish, calories, protein, fat, carbs, sugar, bad_fat, weight, is_liquid, ml, salt, last_id))
+        else:
+            cursor.execute('''
+                UPDATE food_log SET dish = ?, calories = ?, protein = ?, fat = ?, carbs = ?, sugar = ?, bad_fat = ?, weight = ?, salt = ?
+                WHERE id = ?
+            ''', (new_dish, calories, protein, fat, carbs, sugar, bad_fat, weight, salt, last_id))
         conn.commit()
     conn.close()
 
-def get_last_food(user_id):
+def get_last_food(user_id, date):
     conn = _connect()
     cursor = conn.cursor()
-    cursor.execute('SELECT * FROM food_log WHERE user_id = ? AND date = CURRENT_DATE ORDER BY id DESC LIMIT 1', (user_id,))
+    cursor.execute('SELECT * FROM food_log WHERE user_id = ? AND date = ? ORDER BY id DESC LIMIT 1', (user_id, date))
     row = cursor.fetchone()
     conn.close()
     return dict(row) if row else None
 
-def get_last_dish(user_id):
+def get_last_dish(user_id, date):
     conn = _connect()
     cursor = conn.cursor()
-    cursor.execute('SELECT dish FROM food_log WHERE user_id = ? AND date = CURRENT_DATE ORDER BY id DESC LIMIT 1', (user_id,))
+    cursor.execute('SELECT dish FROM food_log WHERE user_id = ? AND date = ? ORDER BY id DESC LIMIT 1', (user_id, date))
     row = cursor.fetchone()
     conn.close()
     return row['dish'] if row else None
 
-def add_water(user_id, ml):
+def add_water(user_id, date, ml):
     conn = _connect()
     cursor = conn.cursor()
-    cursor.execute('INSERT INTO water_log (user_id, ml) VALUES (?, ?)', (user_id, int(ml)))
+    cursor.execute('INSERT INTO water_log (user_id, date, ml) VALUES (?, ?, ?)', (user_id, date, int(ml)))
     conn.commit()
     conn.close()
 
-def get_day_water(user_id):
+def get_day_liquid(user_id, date):
     conn = _connect()
     cursor = conn.cursor()
-    cursor.execute('SELECT SUM(ml) as total FROM water_log WHERE user_id = ? AND date = CURRENT_DATE', (user_id,))
-    result = cursor.fetchone()
-    conn.close()
-    return result['total'] if result and result['total'] else 0
+    cursor.execute('SELECT SUM(ml) as total FROM water_log WHERE user_id = ? AND date = ?', (user_id, date))
+    water_result = cursor.fetchone()
+    water_total = water_result['total'] if water_result and water_result['total'] else 0
 
-def get_water_range(user_id):
-    conn = _connect()
-    cursor = conn.cursor()
-    cursor.execute('SELECT weight FROM users WHERE user_id = ?', (user_id,))
-    row = cursor.fetchone()
+    cursor.execute('SELECT SUM(ml) as total FROM food_log WHERE user_id = ? AND date = ? AND is_liquid = 1', (user_id, date))
+    food_result = cursor.fetchone()
+    food_total = food_result['total'] if food_result and food_result['total'] else 0
     conn.close()
-    if row and row['weight']:
-        center = int(round(float(row['weight']) * 25 / 50.0) * 50)
-        if center > 3000:
-            return 2400, 3000
-        low = int(round(center * 0.9 / 50.0) * 50)
-        high = min(int(round(center * 1.1 / 50.0) * 50), 3000)
-        return low, high
-    return 2000, 2500
+    return water_total + food_total
 
-def get_days_since_registration(user_id):
+def get_water_range(user, norms):
+    # Вода теперь считается от скорректированного веса (п.10)
+    corrected_weight = norms.get('corrected_weight', norms['weight'])
+    center = int(round(corrected_weight * 25 / 50.0) * 50)
+    if center > 3000:
+        return 2400, 3000
+    low = int(round(center * 0.9 / 50.0) * 50)
+    high = min(int(round(center * 1.1 / 50.0) * 50), 3000)
+    return low, high
+
+def get_days_since_registration(user_id, utc_offset):
     conn = _connect()
     cursor = conn.cursor()
     cursor.execute('SELECT created_at FROM users WHERE user_id = ?', (user_id,))
@@ -238,7 +262,9 @@ def get_days_since_registration(user_id):
         return 0
     try:
         reg_date = datetime.strptime(row['created_at'], '%Y-%m-%d %H:%M:%S').date()
-        return (datetime.now().date() - reg_date).days
+        now_utc = datetime.utcnow()
+        user_now = (now_utc + timedelta(hours=utc_offset)).date()
+        return (user_now - reg_date).days
     except ValueError:
         return 0
 
@@ -250,20 +276,21 @@ def get_unique_food_days(user_id):
     conn.close()
     return result['days'] if result else 0
 
-def add_weight(user_id, weight):
+def get_unique_food_days_for_week(user_id, days_passed):
+    # Считаем только за текущую неделю (п.7)
     conn = _connect()
     cursor = conn.cursor()
-    cursor.execute('INSERT INTO weight_log (user_id, weight) VALUES (?, ?)', (user_id, weight))
+    cursor.execute('SELECT COUNT(DISTINCT date) as days FROM food_log WHERE user_id = ? AND date >= date("now", ?)', (user_id, f'-{days_passed} days'))
+    result = cursor.fetchone()
+    conn.close()
+    return result['days'] if result else 0
+
+def add_weight(user_id, date, weight):
+    conn = _connect()
+    cursor = conn.cursor()
+    cursor.execute('INSERT INTO weight_log (user_id, date, weight) VALUES (?, ?, ?)', (user_id, date, weight))
     conn.commit()
     conn.close()
-
-def get_weight_history(user_id, limit=10):
-    conn = _connect()
-    cursor = conn.cursor()
-    cursor.execute('SELECT date, weight FROM weight_log WHERE user_id = ? ORDER BY id DESC LIMIT ?', (user_id, limit))
-    rows = cursor.fetchall()
-    conn.close()
-    return [dict(r) for r in rows][::-1]
 
 def get_calories_history(user_id, days=7):
     conn = _connect()
