@@ -37,8 +37,8 @@ _pending_weekly_weight: set[int] = set()
 _pending_agree: set[int] = set()
 
 # НОВЫЕ ПЕРЕМЕННЫЕ ДЛЯ МЕНЮ
-_pending_menu_mode: dict[int, dict] = {} 
-_active_menu: dict[int, dict] = {} 
+_pending_menu_mode: dict[int, dict] = {} # Ожидание фото меню
+_active_menu: dict[int, dict] = {} # Активное меню (светофор)
 
 _no_guilt_shown_today: dict[int, str] = {}
 
@@ -218,11 +218,13 @@ async def _send_day_summary(message: types.Message, user_id: int):
         )
         await message.answer(text, reply_markup=_main_menu_keyboard(user))
 
+# ==================== ОБРАБОТЧИКИ КНОПОК МЕНЮ (INLINE) ====================
+
 @dp.callback_query(F.data == "menu_build")
 async def cb_menu_build(callback: CallbackQuery):
     user_id = callback.from_user.id
     _pending_menu_mode[user_id] = {"waiting": True}
-    await callback.message.edit_text("Пришли меню (фото или текстом), и я подскажу, что выбрать. Соберу для тебя вкусный и удобный вариант. Без запретов, просто чтобы ты видел картину. 💚")
+    await callback.message.edit_text("Пришли меню (фото или текстом), и я подскажу, что выбрать. Соберу для тебя вкусный и удобный вариант, глядя на твои цифры. Без запретов, просто чтобы ты видел картину. 💚")
     await callback.answer()
 
 @dp.callback_query(F.data == "menu_restaurant")
@@ -239,6 +241,8 @@ async def cb_menu_exit(callback: CallbackQuery):
     await callback.message.edit_text("Мур-мур! Рад, что ты сыт и доволен. Выходим из меню. Приятного вечера! 💚")
     await callback.message.answer("Возвращаемся к обычному дневнику. Присылай, что съел.", reply_markup=_main_menu_keyboard(user))
     await callback.answer()
+
+# ==================== СТАРЫЕ ОБРАБОТЧИКИ ====================
 
 @dp.callback_query(F.data == "delete_last")
 async def cb_delete_last(callback: CallbackQuery):
@@ -386,6 +390,7 @@ async def _handle_message_locked(message: types.Message):
         await message.answer("Жми «Продолжаем?».", reply_markup=_continue_keyboard())
         return
 
+    # Проверка на выход из меню
     if user_id in _active_menu:
         if text == BTN_MUR:
             _active_menu.pop(user_id, None)
@@ -522,10 +527,13 @@ async def _handle_work(message, user_id, text):
     user = database.get_user(user_id)
     today_str = database._get_user_date(user_id, user.get('utc_offset', 3))
 
+    # Проверка на режим "Собери меню"
     if user_id in _pending_menu_mode:
+        # Если нажал кнопку - забываем про меню
         if text in (BTN_EAT, BTN_HELP, BTN_SUMMARY, BTN_MENU):
             _pending_menu_mode.pop(user_id, None)
         else:
+            # Обработка присланного меню
             if message.photo:
                 await message.answer("Секунду, смотрю меню... 🐾")
                 photo = message.photo[-1]
@@ -547,13 +555,14 @@ async def _handle_work(message, user_id, text):
             else:
                 await message.answer("Секунду, смотрю меню... 🐾")
             
+            # Считаем остаток калорий
             summary = database.get_day_summary(user_id, today_str)
             day_cal = int(summary['calories']) if summary else 0
             norms = _calc_norms(user)
             cal_loss = max(0, norms['loss_high'] - day_cal)
             cal_support = max(0, norms['support_high'] - day_cal)
 
-            menu_res = ai.analyze_menu_and_build_traffic_light(text, cal_loss, cal_support, user.get('week', 1))
+            menu_res = ai.analyze_menu_and_build_traffic_light(text, cal_loss, cal_support)
             
             if not menu_res or not menu_res.get("is_menu"):
                 await message.answer("Похоже, это не меню. Пришли, пожалуйста, фото меню или напиши названия блюд, и я помогу сориентироваться. 💚")
@@ -561,54 +570,41 @@ async def _handle_work(message, user_id, text):
             
             _pending_menu_mode.pop(user_id, None)
             
-            if user.get('week', 1) == 1:
-                light = menu_res.get("light", [])
-                heavy = menu_res.get("heavy", [])
-                
-                _active_menu[user_id] = {"light": light, "heavy": heavy, "week1": True}
-                
-                reply_text = "🐾 <b>Давай посмотрим, что есть в меню:</b>\n\n"
-                if light:
-                    reply_text += "🟢 <b>Полегче (много белка, меньше масла):</b>\n" + ", ".join([_esc(d) for d in light]) + "\n\n"
-                if heavy:
-                    reply_text += "🔴 <b>Поплотнее (много калорий/жира):</b>\n" + ", ".join([_esc(d) for d in heavy]) + "\n\n"
-                
-                reply_text += "<i>Сейчас у нас неделя привычек, поэтому я не считаю нормы. Выбирай то, что тебе по душе, и я запишу. 🐾</i>\n\n"
-                reply_text += "Напиши название блюда, которое хочешь записать, или нажми «Мур, я сыт и доволен», чтобы выйти."
-            else:
-                green = menu_res.get("green")
-                yellow = menu_res.get("yellow")
-                red = menu_res.get("red")
-                
-                _active_menu[user_id] = {"green": green, "yellow": yellow, "red": red, "week1": False}
-                
-                reply_text = "🐾 <b>Давай посмотрим, что подойдёт:</b>\n\n"
-                if green:
-                    reply_text += f"🟢 <b>Чтобы продолжать худеть (много белка):</b>\n{_esc(green['dish'])} — сытно и легко.\n\n"
-                if yellow:
-                    reply_text += f"🟡 <b>Худеть, но сегодня чуть медленнее (точно без лишнего):</b>\n{_esc(yellow['dish'])} — вкусно, а завтра спокойно продолжим.\n\n"
-                if red:
-                    reply_text += f"🔴 <b>Если очень хочется (можно всё):</b>\n{_esc(red['dish'])} — можно всё. Если выберешь это, я просто запишу, и завтра вернёмся в ритм.\n\n"
-                
-                reply_text += "<i>Помни: еда — это не ошибка. Выбирай то, что тебе сейчас по-настоящему хочется. Я рядом. 🐾</i>\n\n"
-                reply_text += "Если хочешь записать предложенный вариант, просто напиши <b>красный</b>, <b>жёлтый</b> или <b>зелёный</b>. Или укажи свой выбор из этого меню. 💚"
+            green = menu_res.get("green")
+            yellow = menu_res.get("yellow")
+            red = menu_res.get("red")
+            
+            _active_menu[user_id] = {"green": green, "yellow": yellow, "red": red}
+            
+            reply_text = "🐾 <b>Давай посмотрим, что подойдёт:</b>\n\n"
+            if green:
+                reply_text += f"🟢 <b>Чтобы продолжать худеть (много белка):</b>\n{_esc(green['dish'])} — сытно и легко.\n\n"
+            if yellow:
+                reply_text += f"🟡 <b>Худеть, но сегодня чуть медленнее (точно без лишнего):</b>\n{_esc(yellow['dish'])} — вкусно, а завтра спокойно продолжим.\n\n"
+            if red:
+                reply_text += f"🔴 <b>Если очень хочется (можно всё):</b>\n{_esc(red['dish'])} — можно всё. Если выберешь это, я просто запишу, и завтра вернёмся в ритм.\n\n"
+            
+            reply_text += "<i>Помни: еда — это не ошибка. Выбирай то, что тебе сейчас по-настоящему хочется. Я рядом. 🐾</i>\n\n"
+            reply_text += "Если хочешь записать предложенный вариант, просто напиши <b>красный</b>, <b>жёлтый</b> или <b>зелёный</b>. Или укажи свой выбор из этого меню. 💚"
             
             await message.answer(reply_text, reply_markup=_exit_menu_keyboard())
             return
 
+    # Обработка активного меню (если человек пишет цвет или блюдо)
     if user_id in _active_menu:
         if text in (BTN_EAT, BTN_HELP, BTN_SUMMARY, BTN_MENU):
-            pass
-        elif text_lower in ["зеленый", "зелёный", "желтый", "жёлтый", "красный"] and not _active_menu[user_id].get("week1"):
+            # Сбрасываем меню, если нажата глобальная кнопка
+            pass # Логика кнопок обработается ниже
+        elif text_lower in ["зеленый", "зелёный", "желтый", "жёлтый", "красный"]:
             menu_data = _active_menu[user_id]
             color_key = "green" if "зелен" in text_lower else "yellow" if "желт" in text_lower else "red"
             dish = menu_data.get(color_key)
             
             if not dish:
-                await message.answer(f"В этой зоне сегодня пусто. Выбери другое блюдо или напиши свой вариант.")
+                await message.answer(f"В {color_key} зоне сегодня пусто. Выбери другое блюдо или напиши свой вариант.")
                 return
             
-            _active_menu.pop(user_id, None)
+            _active_menu.pop(user_id, None) # Выходим из меню после выбора
             
             food_data = {
                 "dish": dish["dish"],
@@ -623,12 +619,12 @@ async def _handle_work(message, user_id, text):
             await message.answer("Приятного аппетита! 💚")
             return
         else:
-            # Человек написал какое-то блюдо (или выбрал из списка на 1 неделе)
+            # Человек написал какое-то блюдо
             _active_menu.pop(user_id, None)
             _pending_clarification[user_id] = {
                 "original_text": text,
                 "dish": text,
-                "questions": ["Похоже, этого блюда не было в списке. Записать его отдельно, как обычную еду? Напиши «да» или «нет»."],
+                "questions": ["Похоже, этого блюда не было в меню. Записать его отдельно, как обычную еду? Напиши «да» или «нет»."],
                 "answers": [],
                 "current_index": 0,
                 "is_fix": False,
@@ -672,6 +668,7 @@ async def _handle_work(message, user_id, text):
         await message.answer("Помогу сориентироваться в меню и подобрать блюда под твои цифры. Выбери, как поступим: 🐾", reply_markup=_menu_inline_keyboard())
         return
 
+    # ЛОГИКА ОЖИДАНИЯ "ДА" ИЛИ "НЕТ" В РЕЖИМЕ ПОМОЩИ
     if user_id in _help_waiting_answer:
         if text_lower in ("да", "ага", "угу", "конечно"):
             _help_waiting_answer.discard(user_id)
@@ -746,6 +743,7 @@ async def _handle_clarification_answer(message, user_id, text, today_str):
     pending = _pending_clarification.get(user_id)
     if not pending: return
 
+    # Если это подтверждение из меню
     if pending.get("is_menu_confirm"):
         _pending_clarification.pop(user_id, None)
         if text.lower() in ("да", "ага", "угу", "конечно"):
@@ -803,13 +801,16 @@ async def _handle_clarification_answer(message, user_id, text, today_str):
 
     answer = text.strip()
     
+    # Проверяем, что это число (1-2 цифры)
     if answer.isdigit() and len(answer) <= 2:
         current_q = pending["questions"][pending["current_index"]].lower()
+        # Если вопрос про проценты или граммы - не переспрашиваем
         if any(w in current_q for w in ("процент", "жирност", "грамм", "мл", "объем", "вес")):
-            pass
+            pass # Принимаем как есть
         elif "штук" in current_q or "сколько" in current_q:
-            pass
+            pass # Принимаем как штуки
         else:
+            # Если непонятно - переспрашиваем
             await message.answer(f"Ты имеешь в виду {answer} штуки или {answer} грамма?")
             return
 

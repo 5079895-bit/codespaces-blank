@@ -1,18 +1,18 @@
 import sqlite3
 import logging
 import os
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'bot_database.db')
 
 def _connect():
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=10) # Добавлен timeout (защита от блокировки, п.3)
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=10)
     conn.row_factory = sqlite3.Row
     return conn
 
 def _get_user_date(user_id, utc_offset):
     """Возвращает текущую дату пользователя с учетом его часового пояса"""
-    now_utc = datetime.utcnow()
+    now_utc = datetime.now(timezone.utc)
     user_now = now_utc + timedelta(hours=utc_offset)
     return user_now.strftime('%Y-%m-%d')
 
@@ -144,7 +144,7 @@ def set_step(user_id, step):
 def create_user(user_id):
     conn = _connect()
     cursor = conn.cursor()
-    now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    now = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
     cursor.execute(
         'INSERT OR IGNORE INTO users (user_id, survey_step, created_at, week, last_norms_update) VALUES (?, 0, ?, 1, ?)',
         (user_id, now, now)
@@ -243,7 +243,6 @@ def get_day_liquid(user_id, date):
     return water_total + food_total
 
 def get_water_range(user, norms):
-    # Вода теперь считается от скорректированного веса (п.10)
     corrected_weight = norms.get('corrected_weight', norms['weight'])
     center = int(round(corrected_weight * 25 / 50.0) * 50)
     if center > 3000:
@@ -262,7 +261,7 @@ def get_days_since_registration(user_id, utc_offset):
         return 0
     try:
         reg_date = datetime.strptime(row['created_at'], '%Y-%m-%d %H:%M:%S').date()
-        now_utc = datetime.utcnow()
+        now_utc = datetime.now(timezone.utc)
         user_now = (now_utc + timedelta(hours=utc_offset)).date()
         return (user_now - reg_date).days
     except ValueError:
@@ -277,7 +276,6 @@ def get_unique_food_days(user_id):
     return result['days'] if result else 0
 
 def get_unique_food_days_for_week(user_id, days_passed):
-    # Считаем только за текущую неделю (п.7)
     conn = _connect()
     cursor = conn.cursor()
     cursor.execute('SELECT COUNT(DISTINCT date) as days FROM food_log WHERE user_id = ? AND date >= date("now", ?)', (user_id, f'-{days_passed} days'))
