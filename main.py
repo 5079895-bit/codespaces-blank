@@ -36,13 +36,19 @@ _pending_week_end: set[int] = set()
 _pending_weekly_weight: set[int] = set()
 _pending_agree: set[int] = set()
 
+# НОВЫЕ ПЕРЕМЕННЫЕ ДЛЯ МЕНЮ
+_pending_menu_mode: dict[int, dict] = {} 
+_active_menu: dict[int, dict] = {} 
+
 _no_guilt_shown_today: dict[int, str] = {}
 
-BTN_EAT = "🍽 Записать еду"
-BTN_SUMMARY = "📊 Итог дня"
-BTN_HELP = "🐾 Котик, подскажи..."
+BTN_EAT = "🍽 ЗАПИСАТЬ ЕДУ"
+BTN_SUMMARY = "⏰ ИТОГ ДНЯ"
+BTN_HELP = "🐾 КОТИК, ПОДСКАЖИ"
+BTN_MENU = "✨ ЗАЙТИ КРАСИВО"
 BTN_CONTINUE = "➡️ Продолжаем?"
 BTN_AGREE = "✅ Согласна / Согласен"
+BTN_MUR = "🐈 Мур, я сыт и доволен"
 
 DIARY_HELP_TEXT = (
     "📝 <b>Как вести дневник (это просто!)</b>\n\n"
@@ -73,9 +79,11 @@ def _main_menu_keyboard(user: dict) -> ReplyKeyboardMarkup:
     user_now = datetime.utcnow() + timedelta(hours=utc_offset)
     
     buttons = [[KeyboardButton(text=BTN_EAT)]]
+    buttons.append([KeyboardButton(text=BTN_HELP)])
+    buttons.append([KeyboardButton(text=BTN_MENU)])
+    
     if user_now.hour >= 19:
         buttons.append([KeyboardButton(text=BTN_SUMMARY)])
-    buttons.append([KeyboardButton(text=BTN_HELP)])
     
     return ReplyKeyboardMarkup(
         keyboard=buttons,
@@ -102,6 +110,17 @@ def _food_inline_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✏️ Исправить", callback_data="fix_last")],
         [InlineKeyboardButton(text="🗑 Убрать из дневника", callback_data="delete_last")]
+    ])
+
+def _menu_inline_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📋 Собери меню", callback_data="menu_build")],
+        [InlineKeyboardButton(text="🍽 Иду в ресторан", callback_data="menu_restaurant")]
+    ])
+
+def _exit_menu_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=BTN_MUR, callback_data="menu_exit")]
     ])
 
 def _calc_norms(user: dict) -> dict:
@@ -179,7 +198,7 @@ async def _send_day_summary(message: types.Message, user_id: int):
         ai_text = ai.generate_day_summary(user, summary, liquid_total) or "Ты сегодня отлично потрудился! 💚"
         await message.answer(
             f"🔥 <b>За сегодня:</b> {day_cal} ккал | Б {day_prot} / Ж {day_fat} / У {day_carb}\n"
-            f"💧 Вода: {liquid_total} мл\n\n"
+            f"💧 Жидкость: {liquid_total} мл\n\n"
             f"{ai_text}",
             reply_markup=_main_menu_keyboard(user)
         )
@@ -194,10 +213,32 @@ async def _send_day_summary(message: types.Message, user_id: int):
             f"🐾 <b>Твои итоги дня:</b>\n"
             f"🔥 Калории: {day_cal} из {target_cal} ккал (<b>{p_cal}%</b>)\n"
             f"🥩 Белок: {day_prot} из {norms['protein_high']} г ({p_prot}%)\n"
-            f"💧 Вода: {liquid_total} из {norms['water_high']} мл ({p_water}%)\n\n"
+            f"💧 Жидкость: {liquid_total} из {norms['water_high']} мл ({p_water}%)\n\n"
             f"{ai_text}"
         )
         await message.answer(text, reply_markup=_main_menu_keyboard(user))
+
+@dp.callback_query(F.data == "menu_build")
+async def cb_menu_build(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    _pending_menu_mode[user_id] = {"waiting": True}
+    await callback.message.edit_text("Пришли меню (фото или текстом), и я подскажу, что выбрать. Соберу для тебя вкусный и удобный вариант. Без запретов, просто чтобы ты видел картину. 💚")
+    await callback.answer()
+
+@dp.callback_query(F.data == "menu_restaurant")
+async def cb_menu_restaurant(callback: CallbackQuery):
+    await callback.message.edit_text("Ой, эту кнопку мы ещё пилим! 🐾 Бот пока не умеет искать меню по названию заведения. Но мы работаем над этим с утра до ночи и скоро настроим. А пока — просто нажми «Собери меню» или пришли фото меню, и я помогу сориентироваться!")
+    await callback.answer()
+
+@dp.callback_query(F.data == "menu_exit")
+async def cb_menu_exit(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    _active_menu.pop(user_id, None)
+    _pending_menu_mode.pop(user_id, None)
+    user = database.get_user(user_id)
+    await callback.message.edit_text("Мур-мур! Рад, что ты сыт и доволен. Выходим из меню. Приятного вечера! 💚")
+    await callback.message.answer("Возвращаемся к обычному дневнику. Присылай, что съел.", reply_markup=_main_menu_keyboard(user))
+    await callback.answer()
 
 @dp.callback_query(F.data == "delete_last")
 async def cb_delete_last(callback: CallbackQuery):
@@ -266,6 +307,8 @@ async def cmd_reset_test(message: types.Message):
     _pending_weekly_weight.discard(user_id)
     _pending_agree.discard(user_id)
     _no_guilt_shown_today.pop(user_id, None)
+    _active_menu.pop(user_id, None)
+    _pending_menu_mode.pop(user_id, None)
     await message.answer("🧹 Тест сброшен. Всё удалено. Ты на первой неделе.", reply_markup=_main_menu_keyboard(database.get_user(user_id)))
 
 @dp.message()
@@ -342,6 +385,13 @@ async def _handle_message_locked(message: types.Message):
             return
         await message.answer("Жми «Продолжаем?».", reply_markup=_continue_keyboard())
         return
+
+    if user_id in _active_menu:
+        if text == BTN_MUR:
+            _active_menu.pop(user_id, None)
+            _pending_menu_mode.pop(user_id, None)
+            await message.answer("Мур-мур! Рад, что ты сыт и доволен. Выходим из меню. Приятного вечера! 💚", reply_markup=_main_menu_keyboard(user))
+            return
 
     if step == 10:
         await _handle_work(message, user_id, text)
@@ -472,6 +522,121 @@ async def _handle_work(message, user_id, text):
     user = database.get_user(user_id)
     today_str = database._get_user_date(user_id, user.get('utc_offset', 3))
 
+    if user_id in _pending_menu_mode:
+        if text in (BTN_EAT, BTN_HELP, BTN_SUMMARY, BTN_MENU):
+            _pending_menu_mode.pop(user_id, None)
+        else:
+            if message.photo:
+                await message.answer("Секунду, смотрю меню... 🐾")
+                photo = message.photo[-1]
+                file = await bot.get_file(photo.file_id)
+                os.makedirs("downloads", exist_ok=True)
+                file_path = f"downloads/{photo.file_id}.jpg"
+                try:
+                    await bot.download_file(file.file_path, file_path)
+                    photo_result = ai.analyze_photo(file_path)
+                finally:
+                    if os.path.exists(file_path):
+                        try: os.remove(file_path)
+                        except OSError: pass
+                menu_desc = photo_result.get("description", "") if photo_result else ""
+                if not menu_desc:
+                    await message.answer("Не смог разглядеть меню на фото. Попробуй прислать текст или другое фото.")
+                    return
+                text = menu_desc
+            else:
+                await message.answer("Секунду, смотрю меню... 🐾")
+            
+            summary = database.get_day_summary(user_id, today_str)
+            day_cal = int(summary['calories']) if summary else 0
+            norms = _calc_norms(user)
+            cal_loss = max(0, norms['loss_high'] - day_cal)
+            cal_support = max(0, norms['support_high'] - day_cal)
+
+            menu_res = ai.analyze_menu_and_build_traffic_light(text, cal_loss, cal_support, user.get('week', 1))
+            
+            if not menu_res or not menu_res.get("is_menu"):
+                await message.answer("Похоже, это не меню. Пришли, пожалуйста, фото меню или напиши названия блюд, и я помогу сориентироваться. 💚")
+                return
+            
+            _pending_menu_mode.pop(user_id, None)
+            
+            if user.get('week', 1) == 1:
+                light = menu_res.get("light", [])
+                heavy = menu_res.get("heavy", [])
+                
+                _active_menu[user_id] = {"light": light, "heavy": heavy, "week1": True}
+                
+                reply_text = "🐾 <b>Давай посмотрим, что есть в меню:</b>\n\n"
+                if light:
+                    reply_text += "🟢 <b>Полегче (много белка, меньше масла):</b>\n" + ", ".join([_esc(d) for d in light]) + "\n\n"
+                if heavy:
+                    reply_text += "🔴 <b>Поплотнее (много калорий/жира):</b>\n" + ", ".join([_esc(d) for d in heavy]) + "\n\n"
+                
+                reply_text += "<i>Сейчас у нас неделя привычек, поэтому я не считаю нормы. Выбирай то, что тебе по душе, и я запишу. 🐾</i>\n\n"
+                reply_text += "Напиши название блюда, которое хочешь записать, или нажми «Мур, я сыт и доволен», чтобы выйти."
+            else:
+                green = menu_res.get("green")
+                yellow = menu_res.get("yellow")
+                red = menu_res.get("red")
+                
+                _active_menu[user_id] = {"green": green, "yellow": yellow, "red": red, "week1": False}
+                
+                reply_text = "🐾 <b>Давай посмотрим, что подойдёт:</b>\n\n"
+                if green:
+                    reply_text += f"🟢 <b>Чтобы продолжать худеть (много белка):</b>\n{_esc(green['dish'])} — сытно и легко.\n\n"
+                if yellow:
+                    reply_text += f"🟡 <b>Худеть, но сегодня чуть медленнее (точно без лишнего):</b>\n{_esc(yellow['dish'])} — вкусно, а завтра спокойно продолжим.\n\n"
+                if red:
+                    reply_text += f"🔴 <b>Если очень хочется (можно всё):</b>\n{_esc(red['dish'])} — можно всё. Если выберешь это, я просто запишу, и завтра вернёмся в ритм.\n\n"
+                
+                reply_text += "<i>Помни: еда — это не ошибка. Выбирай то, что тебе сейчас по-настоящему хочется. Я рядом. 🐾</i>\n\n"
+                reply_text += "Если хочешь записать предложенный вариант, просто напиши <b>красный</b>, <b>жёлтый</b> или <b>зелёный</b>. Или укажи свой выбор из этого меню. 💚"
+            
+            await message.answer(reply_text, reply_markup=_exit_menu_keyboard())
+            return
+
+    if user_id in _active_menu:
+        if text in (BTN_EAT, BTN_HELP, BTN_SUMMARY, BTN_MENU):
+            pass
+        elif text_lower in ["зеленый", "зелёный", "желтый", "жёлтый", "красный"] and not _active_menu[user_id].get("week1"):
+            menu_data = _active_menu[user_id]
+            color_key = "green" if "зелен" in text_lower else "yellow" if "желт" in text_lower else "red"
+            dish = menu_data.get(color_key)
+            
+            if not dish:
+                await message.answer(f"В этой зоне сегодня пусто. Выбери другое блюдо или напиши свой вариант.")
+                return
+            
+            _active_menu.pop(user_id, None)
+            
+            food_data = {
+                "dish": dish["dish"],
+                "weight": dish.get("weight", 100),
+                "calories": dish.get("calories", 0),
+                "protein": dish.get("protein", 0),
+                "fat": dish.get("fat", 0),
+                "carbs": dish.get("carbs", 0),
+                "sugar": 0, "bad_fat": 0, "salt": 0, "is_liquid": False, "ml": None
+            }
+            await _save_food_and_reply(message, user_id, food_data, fallback_dish=dish["dish"], today_str=today_str, is_fix=False)
+            await message.answer("Приятного аппетита! 💚")
+            return
+        else:
+            # Человек написал какое-то блюдо (или выбрал из списка на 1 неделе)
+            _active_menu.pop(user_id, None)
+            _pending_clarification[user_id] = {
+                "original_text": text,
+                "dish": text,
+                "questions": ["Похоже, этого блюда не было в списке. Записать его отдельно, как обычную еду? Напиши «да» или «нет»."],
+                "answers": [],
+                "current_index": 0,
+                "is_fix": False,
+                "is_menu_confirm": True
+            }
+            await message.answer(f"Похоже, этого блюда не было в меню, которое ты прислал. Записать «{_esc(text)}» отдельно, как обычную еду? Напиши «да» или «нет». 🐾")
+            return
+
     if message.photo:
         await _handle_photo(message, user_id, text if text else None)
         return
@@ -480,20 +645,33 @@ async def _handle_work(message, user_id, text):
         _help_mode.discard(user_id)
         _help_waiting_answer.discard(user_id)
         _pending_clarification.pop(user_id, None)
+        _active_menu.pop(user_id, None)
+        _pending_menu_mode.pop(user_id, None)
         await message.answer("Пришли, что съел — текстом или фото.")
         return
     if text == BTN_SUMMARY or text_lower in ["день", "итог", "итоги"]:
         _help_mode.discard(user_id)
         _help_waiting_answer.discard(user_id)
         _pending_clarification.pop(user_id, None)
+        _active_menu.pop(user_id, None)
+        _pending_menu_mode.pop(user_id, None)
         await _send_day_summary(message, user_id)
         return
     if text == BTN_HELP:
         _help_mode.add(user_id)
+        _active_menu.pop(user_id, None)
+        _pending_menu_mode.pop(user_id, None)
         await message.answer("Я тут! Спрашивай, что тебя интересует про еду или питание. 💚")
         return
+    if text == BTN_MENU:
+        _help_mode.discard(user_id)
+        _help_waiting_answer.discard(user_id)
+        _pending_clarification.pop(user_id, None)
+        _active_menu.pop(user_id, None)
+        _pending_menu_mode.pop(user_id, None)
+        await message.answer("Помогу сориентироваться в меню и подобрать блюда под твои цифры. Выбери, как поступим: 🐾", reply_markup=_menu_inline_keyboard())
+        return
 
-    # НОВАЯ ЛОГИКА ОЖИДАНИЯ "ДА" ИЛИ "НЕТ"
     if user_id in _help_waiting_answer:
         if text_lower in ("да", "ага", "угу", "конечно"):
             _help_waiting_answer.discard(user_id)
@@ -505,7 +683,6 @@ async def _handle_work(message, user_id, text):
             await message.answer("Понял, возвращаемся к дневнику. Присылай, что съел — текстом или фото.", reply_markup=_main_menu_keyboard(user))
             return
         else:
-            # ТУТ МЫ ИГНОРИРУЕМ ЛЮБОЙ ДРУГОЙ ТЕКСТ
             await message.answer("Напиши 'да' или 'нет'.")
             return
 
@@ -569,6 +746,34 @@ async def _handle_clarification_answer(message, user_id, text, today_str):
     pending = _pending_clarification.get(user_id)
     if not pending: return
 
+    if pending.get("is_menu_confirm"):
+        _pending_clarification.pop(user_id, None)
+        if text.lower() in ("да", "ага", "угу", "конечно"):
+            await message.answer("Секунду, смотрю...")
+            ai_res = ai.get_questions_for_ai(pending["original_text"])
+            dish = ai_res.get("dish", pending["original_text"])
+            questions = ai_res.get("questions", [])
+            
+            if not questions:
+                food_data = ai.calculate_nutrition(dish, pending["original_text"])
+                if food_data and food_data.get('calories') is not None:
+                    await _save_food_and_reply(message, user_id, food_data, fallback_dish=dish, today_str=today_str, is_fix=False)
+                else:
+                    await message.answer("Не смог посчитать.")
+            else:
+                _pending_clarification[user_id] = {
+                    "original_text": pending["original_text"],
+                    "dish": dish,
+                    "questions": questions,
+                    "answers": [],
+                    "current_index": 0,
+                    "is_fix": False
+                }
+                await message.answer(f"Записал: {_esc(dish)}. {_esc(questions[0])}")
+        else:
+            await message.answer("Хорошо, тогда напиши, что выбрать из меню.")
+        return
+
     if pending.get("is_fix"):
         _pending_clarification.pop(user_id, None)
         await message.answer("Секунду, смотрю...")
@@ -597,9 +802,12 @@ async def _handle_clarification_answer(message, user_id, text, today_str):
         return
 
     answer = text.strip()
+    
     if answer.isdigit() and len(answer) <= 2:
         current_q = pending["questions"][pending["current_index"]].lower()
-        if "штук" in current_q or "сколько" in current_q:
+        if any(w in current_q for w in ("процент", "жирност", "грамм", "мл", "объем", "вес")):
+            pass
+        elif "штук" in current_q or "сколько" in current_q:
             pass
         else:
             await message.answer(f"Ты имеешь в виду {answer} штуки или {answer} грамма?")
@@ -726,7 +934,7 @@ async def _save_food_and_reply(message, user_id, food_data, fallback_dish, today
     
     if user.get('week', 1) == 1:
         reply_text += f"📊 <b>За сегодня:</b> {day_cal} ккал | Б {day_prot} / Ж {day_fat} / У {day_carb}\n"
-        reply_text += f"💧 Вода: {liquid_total} мл"
+        reply_text += f"💧 Жидкость: {liquid_total} мл"
     else:
         target_cal = norms['support_high']
         target_prot = norms['protein_high']
@@ -738,7 +946,7 @@ async def _save_food_and_reply(message, user_id, food_data, fallback_dish, today
         
         reply_text += f"📊 <b>За сегодня:</b> {day_cal} из {target_cal} ккал ({p_cal}%)\n"
         reply_text += f"🥩 Белок: {day_prot} из {target_prot} г ({p_prot}%)\n"
-        reply_text += f"💧 Вода: {liquid_total} из {target_water} мл ({p_water}%)"
+        reply_text += f"💧 Жидкость: {liquid_total} из {target_water} мл ({p_water}%)"
     
     if "(среднее)" in dish_name or "(средняя" in dish_name or "стандарт" in dish_name.lower():
          reply_text += "\n\n<i>Взял средний показатель.</i>"
